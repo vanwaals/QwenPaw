@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Resource Governor — 策略评估 + 审计记录 + sandbox config 编译。
+"""Resource Governor — Policy evaluation + audit logging + sandbox config compilation.
 
-核心职责：策略评估、审计记录、动态追加规则、编译 sandbox config。
+Core responsibilities: policy evaluation, audit recording, dynamic rule addition,
+sandbox config compilation.
 """
 from __future__ import annotations
 import logging
@@ -9,83 +10,62 @@ from pathlib import Path
 from typing import Optional
 
 from .policy import (
-    GovernancePolicy, PolicyRule, PolicyAction, PolicyDecision,
+    GovernancePolicy, PolicyRule, PolicyDecision, ToolCallSpec,
     DEFAULT_SANDBOX_DENY_PATHS, FILE_READ_TOOLS, FILE_WRITE_TOOLS,
     load_governance_policy, save_governance_policy,
     _parse_match,
 )
 from .audit import AuditLog
+from ...constant import WORKING_DIR
+
+from ...sandbox import SandboxCapability, SandboxConfig, MountSpec, probe_sandbox_support, detect_platform_mode
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# ToolCall — workspace 对 tool call 的抽象输入
-# ---------------------------------------------------------------------------
-
-class ToolCall:
-    """一次 tool 调用的描述（workspace 用于裁决）。
-
-    Attributes:
-        tool_name: tool 名称，如 "Read", "Bash", "Write"
-        target: tool 的目标参数，如 "src/main.py", "git push"
-        agent_id: 发起调用的 agent ID
-        session_id: 当前会话 ID
-    """
-
-    def __init__(self, tool_name: str, target: str,
-                 agent_id: str, session_id: str):
-        self.tool_name = tool_name
-        self.target = target
-        self.agent_id = agent_id
-        self.session_id = session_id
-
-
 class ResourceGovernor:
-    """ResourceGovernor — 策略与审计的核心。
+    """ResourceGovernor — core of policy and audit.
 
-    职责：
-        1. 策略评估：assert_and_audit(tool_call) → PolicyDecision
-        2. 编译 sandbox config：compile_sandbox_config() → SandboxConfig
-        3. 审计记录：每次 assert_and_audit 记录 audit log
-        4. 动态追加规则：用户 approve 后 add_rule(...)
+    Responsibilities:
+        1. Policy evaluation: assert_and_audit(tool_call) → PolicyDecision
+        2. Sandbox config compilation: compile_sandbox_config() → SandboxConfig
+        3. Audit logging: each assert_and_audit records an audit log entry
+        4. Dynamic rule addition: add_rule(...) after user approval
 
-    NOT responsible for（待讨论）：
-        - sandbox 创建/销毁 → 由协调层管理
-        - Runtime/Agent 编排 → 待定
+    NOT responsible for (TBD):
+        - sandbox creation/destruction → managed by orchestration layer
+        - Runtime/Agent scheduling → TBD
     """
 
     def __init__(self, workspace_dir: str):
         self.workspace_dir = Path(workspace_dir)
-        # policy 存储在 workspace 外的独立路径，防止 agent 改写
-        self._policy_dir = Path.home() / ".qwenpaw" / "policies" / self.workspace_dir.name
+        # Policy is stored outside the workspace to prevent agent tampering
+        self._policy_dir = WORKING_DIR / "policies" / self.workspace_dir.name
         self._policy: Optional[GovernancePolicy] = None
         self._sandbox_available: bool = False
-        self._sandbox_capability = None  # SandboxCapability, set in start()
+        self._sandbox_capability: Optional[SandboxCapability] = None
 
     # ------------------------------------------------------------------
-    # 生命周期（保留但不展开，与 runtime 有重叠）
+    # Lifecycle (kept but not expanded, overlaps with runtime)
     # ------------------------------------------------------------------
 
     @property
     def sandbox_available(self) -> bool:
-        """当前平台是否支持沙箱隔离。启动后可读。"""
+        """Whether the current platform supports sandbox isolation. Readable after start()."""
         return self._sandbox_available
 
     @property
-    def sandbox_capability(self):
-        """启动探测结果（SandboxCapability）。"""
+    def sandbox_capability(self) -> Optional[SandboxCapability]:
+        """Probe result from start() (SandboxCapability)."""
         return self._sandbox_capability
 
     def start(self) -> None:
-        """加载 policy 并探测沙箱能力。"""
+        """Load policy and probe sandbox capabilities."""
         self._policy_dir.mkdir(parents=True, exist_ok=True)
         self._policy = load_governance_policy(
             str(self._policy_dir), str(self.workspace_dir),
         )
 
-        # 早期探测：当前平台是否支持沙箱
-        from qwenpaw.sandbox.config import probe_sandbox_support
         self._sandbox_capability = probe_sandbox_support()
         self._sandbox_available = self._sandbox_capability.supported
         if not self._sandbox_available:
@@ -96,91 +76,87 @@ class ResourceGovernor:
             )
 
     def stop(self) -> None:
-        """持久化 policy（如有变更）。"""
+        """Persist policy (if modified)."""
         if self._policy and self._policy.rules:
             save_governance_policy(
                 self._policy, str(self._policy_dir), str(self.workspace_dir),
             )
 
     # ------------------------------------------------------------------
-    # 核心接口 1：策略评估 + 审计
+    # Core interface 1: Policy evaluation + audit
     # ------------------------------------------------------------------
 
-    def assert_and_audit(self, tool_call: ToolCall) -> PolicyDecision:
-        """对一次 tool call 进行策略裁决并记录审计日志。
+    def assert_and_audit(self, tc_spec: ToolCallSpec) -> PolicyDecision:
+        """Evaluate policy for a tool call and record an audit log entry.
 
-        流程：
+        Flow:
             1. policy.evaluate(tool_name, target, agent_id) → decision
-            2. audit_log.append(tool_call, decision)
+            2. audit_log.append(tc_spec, decision)
             3. return decision
 
-        返回 PolicyDecision:
-            ALLOW            → 明确 resource tool 直接执行；
-                               bash tool sandbox 内预授权执行
-            DENY             → 拒绝
-            ASK              → 问用户
-            SANDBOX_FALLBACK → bash 类 tool 无命中，sandbox 兜底
+        Returns PolicyDecision:
+            ALLOW            → explicit resource tool executes directly;
+                               bash tool executes with sandbox pre-authorization
+            DENY             → rejected
+            ASK              → ask user
+            SANDBOX_FALLBACK → bash tool with no rule match, sandbox fallback
         """
-        # 对文件类 tool，将相对路径 target 解析为绝对路径
-        # （shell/network/internal 类 tool 的 target 不是文件路径，不需要解析）
-        target = tool_call.target
-        tool_type = self._policy._registry.get_type(tool_call.tool_name)
+        # For file tools, resolve relative target paths to absolute paths
+        # (shell/network/internal tool targets are not file paths, no resolution needed)
+        target = tc_spec.target
+        tool_type = self._policy._registry.get_type(tc_spec.tool_name)
         if tool_type in ("file", "unknown") and target and not Path(target).is_absolute():
             target = str(self.workspace_dir / target)
 
-        decision, reason = self.policy.evaluate_with_reason(
-            tool_call.tool_name, target,
-            tool_call.agent_id, tool_call.session_id,
+        decision, reason = self.policy.evaluate(
+            tc_spec.tool_name, target,
+            tc_spec.agent_id, tc_spec.session_id,
         )
 
-        # 早期探测降级：如果 sandbox 不可用，SANDBOX_FALLBACK 升级为 ASK
+        # Early probe degradation: if sandbox is unavailable, escalate SANDBOX_FALLBACK to ASK
         if decision is PolicyDecision.SANDBOX_FALLBACK and not self._sandbox_available:
             logger.info(
                 "ResourceGovernor: sandbox unavailable, escalating "
                 "SANDBOX_FALLBACK to ASK for tool '%s'",
-                tool_call.tool_name,
+                tc_spec.tool_name,
             )
             decision = PolicyDecision.ASK
             reason = f"sandbox unavailable ({self._sandbox_capability.reason}), ask user"
 
-        # 审计记录
+        # Audit record
         AuditLog.get_instance().record(
-            str(self.workspace_dir), tool_call, decision, reason=reason,
+            str(self.workspace_dir), tc_spec, decision, reason=reason,
         )
         return decision
 
     # ------------------------------------------------------------------
-    # 核心接口 2：编译 sandbox config
+    # Core interface 2: Compile sandbox config
     # ------------------------------------------------------------------
 
     def compile_sandbox_config(
-        self, tool_call: ToolCall,
-    ):
-        """根据当前 policy 编译 sandbox 的文件系统权限配置。
+        self, tc_spec: ToolCallSpec,
+    ) -> SandboxConfig:
+        """Compile sandbox filesystem permission config based on current policy.
 
-        sandbox 的安全模型：
-            - workspace 作为工作目录，始终 readwrite mount（Bash 需要正常工作）
-            - user_rules 中 FILE_READ_TOOLS / FILE_WRITE_TOOLS 的路径编译为 mounts
-            - deny_paths 阻止敏感路径（defense-in-depth）
-            - policy 裁决控制命令能否执行，sandbox 控制文件系统边界
+        Sandbox security model:
+            - Workspace is the working directory, always mounted readwrite (Bash needs it to work)
+            - Paths from FILE_READ_TOOLS / FILE_WRITE_TOOLS in user_rules are compiled into mounts
+            - deny_paths block sensitive paths (defense-in-depth)
+            - Policy decisions control whether a command can execute; sandbox controls filesystem boundaries
 
-        mounts 编译逻辑：
-            遍历 user_rules，对每条规则：
-              - 解析 match → (tool_name, pattern)
-              - 如果 tool_name ∈ FILE_READ_TOOLS → readonly mount
-              - 如果 tool_name ∈ FILE_WRITE_TOOLS → readwrite mount
-            相同路径以最宽松权限为准（write > read）。
+        Mounts compilation logic:
+            Iterate over user_rules, for each rule:
+              - Parse match → (tool_name, pattern)
+              - If tool_name ∈ FILE_READ_TOOLS → readonly mount
+              - If tool_name ∈ FILE_WRITE_TOOLS → readwrite mount
+            Same path uses the most permissive access (write > read).
 
-        返回 SandboxConfig dataclass（来自 qwenpaw.sandbox.config）。
+        Returns SandboxConfig dataclass (from qwenpaw.sandbox.config).
         """
-        from qwenpaw.sandbox.config import (
-            MountSpec, SandboxConfig, detect_platform_mode,
-        )
-
         ws = str(self.workspace_dir)
 
-        # ── 从 user_rules 编译 mounts ──
-        # path → writable 映射：同一路径以最宽松为准
+        # ── Compile mounts from user_rules ──
+        # path → writable mapping: same path uses the most permissive access
         mount_map: dict[str, bool] = {}
 
         for rule in self.policy.user_rules:
@@ -189,13 +165,13 @@ class ResourceGovernor:
             except (ValueError, IndexError):
                 continue
 
-            # 从 pattern 提取路径：去掉尾部的 * 等通配符以得到目录前缀
+            # Extract path from pattern: strip trailing * and other wildcards to get directory prefix
             path = self._resolve_mount_path(rule_pattern, ws)
             if not path:
                 continue
 
             if rule_tool in FILE_READ_TOOLS:
-                # readonly mount，但若已有 write 则保持 write
+                # readonly mount, but keep write if already present
                 if path not in mount_map:
                     mount_map[path] = False
             elif rule_tool in FILE_WRITE_TOOLS:
@@ -206,7 +182,7 @@ class ResourceGovernor:
             MountSpec(path=p, writable=w)
             for p, w in mount_map.items()
         ]
-        # workspace 始终 readwrite
+        # Workspace is always readwrite
         mounts.insert(0, MountSpec(path=ws, writable=True))
 
         return SandboxConfig(
@@ -220,77 +196,77 @@ class ResourceGovernor:
 
     @staticmethod
     def _resolve_mount_path(pattern: str, workspace_dir: str) -> str:
-        """从规则 pattern 推导 mount 路径。
+        """Derive a mount path from a rule pattern.
 
-        处理策略：
-            - WORKSPACE_DIR/* → workspace_dir（整体 mount）
-            - /absolute/path/* → /absolute/path（取目录部分）
-            - 相对路径 → workspace_dir / 相对路径（取目录部分）
-            - 纯通配符 (*、**) → 跳过，无法推导具体路径
+        Strategy:
+            - WORKSPACE_DIR/* → workspace_dir (mount as a whole)
+            - /absolute/path/* → /absolute/path (take directory part)
+            - relative path → workspace_dir / relative (take directory part)
+            - Pure wildcards (*, **) → skip, cannot derive a concrete path
         """
         p = pattern.rstrip("*").rstrip("/")
 
         if not p or p == ".":
             return ""
 
-        # WORKSPACE_DIR 占位符（理论上 load 时已替换，做防御性处理）
+        # WORKSPACE_DIR placeholder (defensive: should already be replaced at load time)
         if "WORKSPACE_DIR" in p:
             p = p.replace("WORKSPACE_DIR", workspace_dir)
 
-        # 绝对路径
+        # Absolute path
         if p.startswith("/"):
             return p
 
-        # 相对路径 → 基于 workspace 解析
+        # Relative path → resolve based on workspace
         return str(Path(workspace_dir) / p)
 
     # ------------------------------------------------------------------
-    # 核心接口 3：动态追加规则
+    # Core interface 3: Dynamic rule addition
     # ------------------------------------------------------------------
 
     def add_rule(self, rule: PolicyRule) -> None:
-        """用户 approve 后动态追加规则到 policy。
+        """Dynamically append a rule to the policy after user approval.
 
-        approve 后的规则会带 duration（session / permanent）。
-        并持久化到 policy.yaml中。
-        注意：规则只追加到 user_rules，builtin_rules 不可修改。
+        Approved rules carry a duration (session / permanent).
+        The rule is also persisted to policy.yaml.
+        Note: rules are only appended to user_rules; builtin_rules are immutable.
         """
         self.policy.add_rule(rule)
         save_governance_policy(
             self._policy, str(self._policy_dir), str(self.workspace_dir),
         )
 
-    def record_approval(self, tool_call: ToolCall, approved: bool) -> None:
-        """记录用户 approve/deny 的结果到审计日志。
+    def record_approval(self, tc_spec: ToolCallSpec, approved: bool) -> None:
+        """Record the user's approve/deny result to the audit log.
 
-        ASK 裁决后用户确认时调用，补全审计链：
-            assert_and_audit → ASK（已记录）
-            record_approval  → ALLOW/DENY（补这条）
+        Called when the user confirms after an ASK decision, completing the audit chain:
+            assert_and_audit → ASK (already recorded)
+            record_approval  → ALLOW/DENY (supplementary entry)
         """
         decision = PolicyDecision.ALLOW if approved else PolicyDecision.DENY
         reason = "User Approve" if approved else "User Deny"
         AuditLog.get_instance().record(
-            str(self.workspace_dir), tool_call, decision, reason=reason,
+            str(self.workspace_dir), tc_spec, decision, reason=reason,
         )
 
-    def is_builtin_ask(self, tool_name: str, target: str,
-                       agent_id: str, session_id: str = "") -> bool:
-        """判断 tool call 的 ASK 是否来自 builtin_rules。
+    def is_builtin_ask(self, tc_spec: ToolCallSpec) -> bool:
+        """Determine whether a tool call's ASK comes from builtin_rules.
 
-        builtin ask → approve 后不记规则（每次都要问）
-        user ask   → approve 后记规则（下次不问）
+        builtin ask → no rule recorded on approval (asks every time)
+        user ask   → rule recorded on approval (won't ask next time)
 
-        由 tool_adapter 的 approve 流程调用，决定是否持久化新规则。
+        Called by tool_adapter's approval flow to decide whether to persist a new rule.
         """
         if not self._policy:
             return False
         source = self._policy.evaluate_source(
-            tool_name, target, agent_id, session_id,
+            tc_spec.tool_name, tc_spec.target,
+            tc_spec.agent_id, tc_spec.session_id,
         )
         return source == "builtin"
 
     # ------------------------------------------------------------------
-    # 属性访问
+    # Property access
     # ------------------------------------------------------------------
 
     @property
@@ -301,6 +277,5 @@ class ResourceGovernor:
 
     @property
     def audit_log(self) -> AuditLog:
-        """获取全局 AuditLog 单例。"""
+        """Get the global AuditLog singleton."""
         return AuditLog.get_instance()
-

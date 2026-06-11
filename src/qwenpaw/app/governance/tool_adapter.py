@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""PolicyGuardedTool — governance 策略检查的 tool wrapper。
+"""PolicyGuardedTool — Governance policy-checked tool wrapper.
 
-替代现有的 GuardedFunctionTool。每次 tool 调用走两层：
-1. check_permissions: 预执行裁决 — ToolCall → governor.assert_and_audit()
-2. __call__: 实际执行 — 处理 sandbox violation retry loop
+Replaces the existing GuardedFunctionTool. Each tool call goes through two layers:
+1. check_permissions: pre-execution decision — ToolCallSpec → governor.assert_and_audit()
+2. __call__: actual execution — handles sandbox violation retry loop
 """
 from __future__ import annotations
 
@@ -13,23 +13,24 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-from .policy import PolicyRule, PolicyAction, PolicyDecision
+from .policy import PolicyRule, PolicyAction, PolicyDecision, ToolCallSpec
 from .tool_registry import DEFAULT_REGISTRY
 
 from agentscope.message import TextBlock
 from agentscope.tool import ToolChunk
 
+from .resource_governor import ResourceGovernor
 
 # ---------------------------------------------------------------------------
 # PolicyGuardedTool
 # ---------------------------------------------------------------------------
 
 class PolicyGuardedTool:
-    """governance 策略检查的 tool wrapper。
+    """Governance policy-checked tool wrapper.
 
-    动态继承 FunctionTool，实现：
-    - check_permissions: 调用 governor.assert_and_audit() 做裁决
-    - __call__: 重写以处理 sandbox execution + violation retry
+    Dynamically inherits from FunctionTool, implementing:
+    - check_permissions: calls governor.assert_and_audit() for policy decision
+    - __call__: overrides to handle sandbox execution + violation retry
     """
 
     def __new__(cls, *args: Any, **kwargs: Any) -> Any:
@@ -54,7 +55,7 @@ def _policy_tool_init(
     self: Any,
     func: Any,
     *,
-    governor: Any = None,
+    governor: Optional[ResourceGovernor] = None,
     request_context: dict[str, str] | None = None,
     **kwargs: Any,
 ) -> None:
@@ -64,8 +65,8 @@ def _policy_tool_init(
     # pylint: disable=protected-access
     self._qp_governor = governor
     self._qp_request_context = request_context or {}
-    self._qp_policy_decision = None  # 预裁决结果
-    self._qp_sandbox_mode = False    # 是否在 sandbox 中执行
+    self._qp_policy_decision = None  # Pre-evaluation result
+    self._qp_sandbox_mode = False    # Whether to execute in sandbox
 
 
 async def _policy_tool_check_permissions(
@@ -75,12 +76,12 @@ async def _policy_tool_check_permissions(
     *_extra_args: Any,
     **_extra_kwargs: Any,
 ) -> Any:
-    """对一次 tool 调用进行 governance 策略裁决。
+    """Perform governance policy evaluation for a tool call.
 
-    流程：
-        1. 构造 ToolCall(tool_name, target, agent_id, session_id)
+    Flow:
+        1. Construct ToolCallSpec(tool_name, target, agent_id, session_id)
         2. governor.assert_and_audit(tool_call) → PolicyDecision
-        3. 映射到 PermissionDecision
+        3. Map to PermissionDecision
     """
     from agentscope.permission import PermissionBehavior, PermissionDecision
 
@@ -88,7 +89,7 @@ async def _policy_tool_check_permissions(
 
     governor = getattr(self, "_qp_governor", None)
     if governor is None:
-        # ResourceGovernor 未初始化 → bypass
+        # ResourceGovernor not initialized → bypass
         return PermissionDecision(
             behavior=PermissionBehavior.ALLOW,
             message="PolicyGuardedTool: governor not started — bypass.",
@@ -107,18 +108,18 @@ async def _policy_tool_check_permissions(
         "session_id", ""
     )
 
-    from .resource_governor import ToolCall
+    
 
-    tool_call = ToolCall(
+    tc_spec = ToolCallSpec(
         tool_name=tool_name,
         target=target,
         agent_id=agent_id,
         session_id=session_id,
     )
 
-    decision = governor.assert_and_audit(tool_call)
+    decision = governor.assert_and_audit(tc_spec)
 
-    # 缓存裁决结果供 __call__ 使用
+    # Cache the decision for __call__ to use
     self._qp_policy_decision = decision
     self._qp_sandbox_mode = False
 
@@ -134,15 +135,15 @@ async def _policy_tool_check_permissions(
             f"(target: {target}).",
         )
     elif decision is PolicyDecision.SANDBOX_FALLBACK:
-        # Bash 类 tool 无规则命中 → 允许进入 sandbox 执行
+        # Bash tool with no rule match → allow execution in sandbox
         self._qp_sandbox_mode = True
-        self._qp_sandbox_config = governor.compile_sandbox_config(tool_call)
+        self._qp_sandbox_config = governor.compile_sandbox_config(tc_spec)
         return PermissionDecision(
             behavior=PermissionBehavior.ALLOW,
             message="governance: sandbox fallback.",
         )
     elif decision is PolicyDecision.ASK:
-        # 需要用户确认
+        # Requires user confirmation
         self._qp_policy_decision = decision
         return await _ask_user_approval(
             governor=governor,
@@ -154,7 +155,7 @@ async def _policy_tool_check_permissions(
             request_context=getattr(self, "_qp_request_context", {}) or {},
         )
     else:
-        # 未知 decision → deny 作为安全默认
+        # Unknown decision → deny as safe default
         return PermissionDecision(
             behavior=PermissionBehavior.DENY,
             message=f"Unknown policy decision: {decision}",
@@ -166,10 +167,10 @@ async def _policy_tool_call(
     *args: Any,
     **kwargs: Any,
 ) -> Any:
-    """重写 FunctionTool.__call__，处理 sandbox execution + violation retry。
+    """Override FunctionTool.__call__ to handle sandbox execution + violation retry.
 
-    如果 sandbox 执行时触发 violation（ToolChunk state=DENIED），向用户请求审批。
-    如果用户批准，则重试（不带 sandbox）。
+    If sandbox execution triggers a violation (ToolChunk state=DENIED), request user approval.
+    If the user approves, retry without sandbox.
     """
     sandbox_mode = getattr(self, "_qp_sandbox_mode", False)
     if sandbox_mode:
@@ -177,7 +178,7 @@ async def _policy_tool_call(
         if sandbox_config is not None:
             kwargs["sandbox_config"] = sandbox_config
 
-    # 调原始函数
+    # Call the original function
     from agentscope.tool import FunctionTool
     from agentscope.message import ToolResultState
 
@@ -263,19 +264,19 @@ async def _policy_tool_call(
 
 
 # ---------------------------------------------------------------------------
-# ASK 路径：复用 ApprovalService
+# ASK path: reuse ApprovalService
 # ---------------------------------------------------------------------------
 
 async def _ask_user_approval(
-    governor: Any,
+    governor: ResourceGovernor,
     tool_name: str,
     target: str,
-    input_data: dict,
+    input_data: dict[str, Any],
     agent_id: str,
     session_id: str,
-    request_context: dict,
+    request_context: dict[str, str],
 ) -> Any:
-    """向用户请求 approve，阻塞等待回复。"""
+    """Request user approval, blocking until a reply is received."""
     from agentscope.permission import PermissionBehavior, PermissionDecision
 
     from ...app.approvals import get_approval_service
@@ -297,7 +298,7 @@ async def _ask_user_approval(
     root_session_id = str(ctx.get("root_session_id") or session_id)
     root_agent_id = str(ctx.get("root_agent_id") or agent_id or "unknown")
 
-    # 构造合成 ToolGuardResult 供 ApprovalService 使用
+    # Construct a synthetic ToolGuardResult for ApprovalService
     guard_result = ToolGuardResult(
         tool_name=tool_name,
         params=input_data,
@@ -367,29 +368,26 @@ async def _ask_user_approval(
         )
         decision = ApprovalDecision.DENIED
 
-    # 记录用户 approve/deny 结果到审计日志
-    from .resource_governor import ToolCall
-    approval_call = ToolCall(tool_name, target, agent_id, session_id)
+    # Record user approve/deny result to audit log
+    tc_spec = ToolCallSpec(tool_name, target, agent_id, session_id)
     approved = decision == ApprovalDecision.APPROVED
-    governor.record_approval(approval_call, approved)
+    governor.record_approval(tc_spec, approved)
 
     summary = format_findings_summary(guard_result)
     if decision == ApprovalDecision.APPROVED:
-        # ──  区分 builtin ask 和 user ask ──
-        # builtin ask → 不记规则（每次都要问，保护高风险资源）
-        # user ask   → 记泛化规则（下次免问）
-        if not governor.is_builtin_ask(
-            tool_name, target, agent_id, session_id,
-        ):
+        # ── Distinguish builtin ask vs user ask ──
+        # builtin ask → no rule recorded (asks every time, protecting high-risk resources)
+        # user ask   → record generalized rule (skip asking next time)
+        if not governor.is_builtin_ask(tc_spec):
             try:
                 from .policy import generalize_rule_match
 
-                # 规则泛化（§8.2）：取首 token + *
+                # Rule generalization (§8.2): take first token + *
                 generalized = generalize_rule_match(tool_name, target)
                 rule_tool, rule_pattern = generalized.split("(", 1)
                 rule_pattern = rule_pattern.rstrip(")")
 
-                # 空 pattern 保护（§8.1）：空 target 的 tool 不写规则
+                # Empty pattern guard (§8.1): tools with empty target don't write rules
                 if rule_pattern:
                     rule = PolicyRule(
                         match=generalized,

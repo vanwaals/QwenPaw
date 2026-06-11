@@ -1,19 +1,24 @@
 # -*- coding: utf-8 -*-
-"""AuditLog — 每次 assert_and_audit 的审计记录。
+"""AuditLog — Audit records for each assert_and_audit call.
 
-存储方案：单文件 SQLite (~/.qwenpaw/audit.db)，全局单例。
-- record() 立即落库，无内存缓冲
-- query() 支持按 workspace / agent / tool / decision / 时间范围过滤，分页
-- purge() 删除过期记录并 VACUUM 回收空间
-- 自动清理：总条目达到 10 万条时，删除最旧的 1 万条
+Storage: single-file SQLite (~/.qwenpaw/audit.db), global singleton.
+- record() writes immediately, no in-memory buffer
+- query() supports filtering by workspace / agent / tool / decision / time range, with pagination
+- purge() deletes expired records and VACUUMs to reclaim space
+- Auto-cleanup: when total records reach 100k, deletes the oldest 10k
 """
 from __future__ import annotations
 
 import json
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+from ...constant import WORKING_DIR
+
+from .policy import PolicyDecision, ToolCallSpec
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -36,9 +41,9 @@ CREATE INDEX IF NOT EXISTS idx_audit_tool ON audit_events(tool_name);
 
 @dataclass
 class AuditEvent:
-    """一条审计记录。
+    """A single audit record.
 
-    记录 5W：who (agent_id), what (tool_name + target),
+    Records 5W: who (agent_id), what (tool_name + target),
     when (ts), outcome (decision), why (reason).
     """
     ts: str                          # ISO 8601 UTC
@@ -48,12 +53,12 @@ class AuditEvent:
     tool_name: str
     target: str
     decision: str                    # "allow" | "deny" | "ask" | "sandbox_fallback"
-    reason: str = ""                 # 额外说明（如 violation 原因）
+    reason: str = ""                 # Additional explanation (e.g. violation cause)
     extra: dict = field(default_factory=dict)
 
 
 def _event_from_row(row: sqlite3.Row) -> AuditEvent:
-    """从 SQLite 行构造 AuditEvent。"""
+    """Construct an AuditEvent from a SQLite row."""
     return AuditEvent(
         ts=row["ts"],
         workspace_dir=row["workspace_dir"],
@@ -68,28 +73,29 @@ def _event_from_row(row: sqlite3.Row) -> AuditEvent:
 
 
 class AuditLog:
-    """追加式审计日志，SQLite 持久化，全局单例。
+    """Append-only audit log, SQLite-backed, global singleton.
 
-    由多个 ResourceGovernor 共享，每次 assert_and_audit 调用 record() 立即写库。
+    Shared by multiple ResourceGovernor instances; each assert_and_audit
+    call invokes record() which writes to the database immediately.
     """
 
-    MAX_RECORDS = 100_000       # 触发自动清理的阈值
-    PURGE_COUNT = 10_000        # 每次清理删除的条数
-    _CHECK_INTERVAL = 1_000     # 每 N 次 record 检查一次是否需要清理
+    MAX_RECORDS = 100_000       # Threshold to trigger auto-cleanup
+    PURGE_COUNT = 10_000        # Number of records to delete per cleanup
+    _CHECK_INTERVAL = 1_000     # Check if cleanup is needed every N records
 
     _instance: Optional[AuditLog] = None
 
     @classmethod
     def get_instance(cls) -> AuditLog:
-        """获取全局单例，首次调用时初始化。"""
+        """Get the global singleton, initializing on first call."""
         if cls._instance is None:
-            db_path = Path.home() / ".qwenpaw" / "audit" / "audit.db"
+            db_path = WORKING_DIR / "auditlog" / "audit.db"
             cls._instance = cls._create(db_path)
         return cls._instance
 
     @classmethod
     def _create(cls, db_path: Path) -> AuditLog:
-        """内部工厂方法，创建实例并初始化数据库。"""
+        """Internal factory method: create instance and initialize database."""
         obj = object.__new__(cls)
         obj._db_path = db_path
         obj._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,23 +110,22 @@ class AuditLog:
         return obj
 
     def close(self) -> None:
-        """关闭数据库连接，重置单例。"""
+        """Close the database connection and reset the singleton."""
         if self._conn:
             self._conn.close()
             self._conn = None
         AuditLog._instance = None
 
-    def record(self, workspace_dir: str, tool_call, decision,
-               reason: str = "") -> None:
-        """记录一次裁决结果，立即写入 SQLite。
+    def record(self, workspace_dir: str, tc_spec: ToolCallSpec,
+               decision: PolicyDecision, reason: str = "") -> None:
+        """Record a policy decision, writing to SQLite immediately.
 
         Args:
-            workspace_dir: 所属 workspace 路径
-            tool_call: ToolCall 实例
-            decision: PolicyDecision 值
-            reason: 命中规则的说明（如 "环境变量文件包含密钥/凭证"）
+            workspace_dir: Workspace path this event belongs to
+            tc_spec: ToolCallSpec instance
+            decision: PolicyDecision value
+            reason: Matched rule description (e.g. "Env file may contain secrets/credentials")
         """
-        from datetime import datetime, timezone
         self._conn.execute(
             "INSERT INTO audit_events "
             "(ts, workspace_dir, agent_id, session_id, tool_name, target, decision, reason, extra) "
@@ -128,10 +133,10 @@ class AuditLog:
             (
                 datetime.now(timezone.utc).isoformat(),
                 workspace_dir,
-                tool_call.agent_id,
-                tool_call.session_id,
-                tool_call.tool_name,
-                tool_call.target,
+                tc_spec.agent_id,
+                tc_spec.session_id,
+                tc_spec.tool_name,
+                tc_spec.target,
                 str(decision.value),
                 reason,
                 "{}",
@@ -139,7 +144,7 @@ class AuditLog:
         )
         self._conn.commit()
 
-        # 自动清理检查（每 _CHECK_INTERVAL 次检查一次，避免每次都 SELECT COUNT）
+        # Auto-cleanup check
         self._insert_count += 1
         if self._insert_count >= self._CHECK_INTERVAL:
             self._insert_count = 0
@@ -157,20 +162,20 @@ class AuditLog:
         limit: int = 100,
         offset: int = 0,
     ) -> Tuple[List[AuditEvent], int]:
-        """查询审计事件，支持分页。
+        """Query audit events with pagination.
 
         Args:
-            workspace_dir: 按 workspace 过滤
-            agent_id: 按 agent 过滤
-            tool_name: 按工具名过滤
-            decision: 按裁决结果过滤
-            since: 起始时间 (ISO 8601)，含
-            until: 截止时间 (ISO 8601)，含
-            limit: 每页条数
-            offset: 偏移量（翻页用）
+            workspace_dir: Filter by workspace
+            agent_id: Filter by agent
+            tool_name: Filter by tool name
+            decision: Filter by decision result
+            since: Start time (ISO 8601), inclusive
+            until: End time (ISO 8601), inclusive
+            limit: Page size
+            offset: Offset (for pagination)
 
         Returns:
-            (events, total) — 事件列表和符合条件的总条数
+            (events, total) — event list and total count of matching records
         """
         clauses: list[str] = []
         params: list = []
@@ -196,11 +201,11 @@ class AuditLog:
 
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
 
-        # 总条数
+        # Total count
         count_sql = f"SELECT COUNT(*) FROM audit_events{where}"
         total = self._conn.execute(count_sql, params).fetchone()[0]
 
-        # 分页查询
+        # Paginated query
         data_sql = f"SELECT * FROM audit_events{where} ORDER BY ts DESC LIMIT ? OFFSET ?"
         data_params = params + [limit, offset]
         rows = self._conn.execute(data_sql, data_params).fetchall()
@@ -208,13 +213,13 @@ class AuditLog:
         return [_event_from_row(r) for r in rows], total
 
     def purge(self, before: str) -> int:
-        """删除指定时间之前的记录并 VACUUM 回收空间。
+        """Delete records before the specified time and VACUUM to reclaim space.
 
         Args:
-            before: 截止时间 (ISO 8601)，不含
+            before: Cutoff time (ISO 8601), exclusive
 
         Returns:
-            删除的记录数
+            Number of deleted records
         """
         cursor = self._conn.execute(
             "DELETE FROM audit_events WHERE ts < ?", (before,)
@@ -227,13 +232,13 @@ class AuditLog:
 
     @property
     def count(self) -> int:
-        """当前记录总数。"""
+        """Total number of records."""
         return self._conn.execute(
             "SELECT COUNT(*) FROM audit_events"
         ).fetchone()[0]
 
     def _auto_purge(self) -> None:
-        """删除最旧的 PURGE_COUNT 条记录并 VACUUM。"""
+        """Delete the oldest PURGE_COUNT records and VACUUM."""
         row = self._conn.execute(
             "SELECT rowid FROM audit_events ORDER BY rowid ASC LIMIT 1 OFFSET ?",
             (self.PURGE_COUNT,),

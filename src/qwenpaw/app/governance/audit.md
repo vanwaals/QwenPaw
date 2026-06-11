@@ -120,7 +120,7 @@ class AuditLog:
         """获取全局单例，首次调用时初始化。"""
 
     def close(self) -> None                    # 关闭连接，重置单例
-    def record(self, workspace_dir, tool_call, decision) -> None  # 立即写库
+    def record(self, workspace_dir, tc_spec, decision) -> None  # 立即写库
     def query(...) -> List[AuditEvent]         # 按条件查询
     def purge(before: str) -> int              # 删除过期记录 + VACUUM
     @property
@@ -141,15 +141,15 @@ class AuditLog:
 
 ```python
 # resource_governor.py:assert_and_audit
-decision = self.policy.evaluate(tool_call.tool_name, tool_call.target, ...)
+decision, reason = self.policy.evaluate(tc_spec)
 audit_log = AuditLog.get_instance()
-audit_log.record(str(self.workspace_dir), tool_call, decision)
+audit_log.record(str(self.workspace_dir), tc_spec, decision, reason=reason)
 return decision
 ```
 
 `record()` 内部：
 1. 生成 ISO 8601 UTC 时间戳
-2. 从 `ToolCall` 提取 agent_id / session_id / tool_name / target
+2. 从 `ToolCallSpec`提取 agent_id / session_id / tool_name / target
 3. 从 `PolicyDecision` 提取 decision value
 4. 直接 `INSERT INTO` SQLite 并 `COMMIT`
 5. 检查总条目数，若达到 `MAX_RECORDS`（10 万条），自动删除最旧的 `PURGE_COUNT`（1 万条）
@@ -161,7 +161,7 @@ return decision
 当 `record()` 写入后，若总条目数达到阈值，自动触发清理：
 
 ```python
-def record(self, workspace_dir: str, tool_call, decision) -> None:
+def record(self, workspace_dir: str, tc_spec, decision) -> None:
     # ... INSERT (包含 workspace_dir) ...
     self._conn.commit()
     # 自动清理检查
