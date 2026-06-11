@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 from .policy import PolicyRule, PolicyAction, PolicyDecision
 from .tool_registry import DEFAULT_REGISTRY
 
+from agentscope.message import TextBlock
+from agentscope.tool import ToolChunk
+
 
 # ---------------------------------------------------------------------------
 # PolicyGuardedTool
@@ -165,8 +168,8 @@ async def _policy_tool_call(
 ) -> Any:
     """重写 FunctionTool.__call__，处理 sandbox execution + violation retry。
 
-    如果 sandbox 执行时触发 SandboxViolation，向用户请求审批。
-    如果用户批准，则添加规则并重试（不带 sandbox）。
+    如果 sandbox 执行时触发 violation（ToolChunk state=DENIED），向用户请求审批。
+    如果用户批准，则重试（不带 sandbox）。
     """
     sandbox_mode = getattr(self, "_qp_sandbox_mode", False)
     if sandbox_mode:
@@ -176,81 +179,87 @@ async def _policy_tool_call(
 
     # 调原始函数
     from agentscope.tool import FunctionTool
-    try:
-        return await FunctionTool.__call__(self, *args, **kwargs)
-    except Exception as exc:
-        # Check if it's a SandboxViolationError
-        from ...agents.tools.shell import SandboxViolationError
-        if not isinstance(exc, SandboxViolationError):
-            raise
+    from agentscope.message import ToolResultState
 
-        # Sandbox violation: ask user for approval
-        logger.info(
-            "PolicyGuardedTool: sandbox violation for '%s': %s",
-            getattr(self, "name", "Unknown"), exc.violation_msg,
+    result = await FunctionTool.__call__(self, *args, **kwargs)
+
+    # Check if sandbox violation was returned (state=DENIED)
+    if not (isinstance(result, ToolChunk) and result.state == ToolResultState.DENIED):
+        return result
+
+    # Extract violation message from metadata or content
+    violation_msg = ""
+    if hasattr(result, "metadata") and result.metadata:
+        violation_msg = result.metadata.get("sandbox_violation", "")
+    if not violation_msg:
+        # Fallback: extract from content text
+        for block in (result.content or []):
+            if hasattr(block, "text") and "Sandbox violation:" in block.text:
+                violation_msg = block.text.split("Sandbox violation:", 1)[1].split("\n")[0].strip()
+                break
+
+    logger.info(
+        "PolicyGuardedTool: sandbox violation for '%s': %s",
+        getattr(self, "name", "Unknown"), violation_msg,
+    )
+
+    governor = getattr(self, "_qp_governor", None)
+    request_context = getattr(self, "_qp_request_context", {}) or {}
+
+    if governor is None:
+        # No governor, can't approve — return the violation as error
+        return ToolChunk(
+            is_last=True,
+            state=ToolResultState.SUCCESS,
+            content=[TextBlock(
+                type="text",
+                text=f"Sandbox violation: {violation_msg}\n"
+                     f"Command was blocked by sandbox security policy.",
+            )],
         )
 
-        governor = getattr(self, "_qp_governor", None)
-        request_context = getattr(self, "_qp_request_context", {}) or {}
+    # Trigger approval flow
+    tool_name = DEFAULT_REGISTRY.python_to_policy_name(
+        getattr(self, "name", "Unknown"),
+    )
+    input_data = getattr(self, "_qp_last_input_data", {}) or {}
+    target = DEFAULT_REGISTRY.extract_target(tool_name, input_data)
+    agent_id = request_context.get("agent_id", "")
+    session_id = request_context.get("session_id", "")
 
-        if governor is None:
-            # No governor, can't approve — return the violation as error
-            from agentscope.message import TextBlock, ToolResultState
-            from agentscope.tool import ToolChunk
-            return ToolChunk(
-                is_last=True,
-                state=ToolResultState.SUCCESS,
-                content=[TextBlock(
-                    type="text",
-                    text=f"Sandbox violation: {exc.violation_msg}\n"
-                         f"Command was blocked by sandbox security policy.",
-                )],
-            )
+    from agentscope.permission import PermissionBehavior, PermissionDecision
+    decision = await _ask_user_approval(
+        governor=governor,
+        tool_name=tool_name,
+        target=target,
+        input_data=input_data,
+        agent_id=agent_id,
+        session_id=session_id,
+        request_context=request_context,
+    )
 
-        # Trigger approval flow
-        tool_name = DEFAULT_REGISTRY.python_to_policy_name(
+    if decision.behavior == PermissionBehavior.ALLOW:
+        # User approved: retry without sandbox
+        logger.info(
+            "PolicyGuardedTool: user approved sandbox violation, "
+            "retrying without sandbox for '%s'",
             getattr(self, "name", "Unknown"),
         )
-        input_data = getattr(self, "_qp_last_input_data", {}) or {}
-        target = DEFAULT_REGISTRY.extract_target(tool_name, input_data)
-        agent_id = request_context.get("agent_id", "")
-        session_id = request_context.get("session_id", "")
-
-        from agentscope.permission import PermissionBehavior, PermissionDecision
-        decision = await _ask_user_approval(
-            governor=governor,
-            tool_name=tool_name,
-            target=target,
-            input_data=input_data,
-            agent_id=agent_id,
-            session_id=session_id,
-            request_context=request_context,
+        kwargs.pop("sandbox_config", None)
+        self._qp_sandbox_mode = False
+        return await FunctionTool.__call__(self, *args, **kwargs)
+    else:
+        # User denied: return the violation as error
+        return ToolChunk(
+            is_last=True,
+            state=ToolResultState.SUCCESS,
+            content=[TextBlock(
+                type="text",
+                text=f"Sandbox violation: {violation_msg}\n"
+                     f"Command was blocked and user denied approval.\n\n"
+                     f"{_NO_RETRY_INSTRUCTION}",
+            )],
         )
-
-        if decision.behavior == PermissionBehavior.ALLOW:
-            # User approved: retry without sandbox
-            logger.info(
-                "PolicyGuardedTool: user approved sandbox violation, "
-                "retrying without sandbox for '%s'",
-                getattr(self, "name", "Unknown"),
-            )
-            kwargs.pop("sandbox_config", None)
-            self._qp_sandbox_mode = False
-            return await FunctionTool.__call__(self, *args, **kwargs)
-        else:
-            # User denied: return the violation as error
-            from agentscope.message import TextBlock, ToolResultState
-            from agentscope.tool import ToolChunk
-            return ToolChunk(
-                is_last=True,
-                state=ToolResultState.SUCCESS,
-                content=[TextBlock(
-                    type="text",
-                    text=f"Sandbox violation: {exc.violation_msg}\n"
-                         f"Command was blocked and user denied approval.\n\n"
-                         f"{_NO_RETRY_INSTRUCTION}",
-                )],
-            )
 
 
 # ---------------------------------------------------------------------------

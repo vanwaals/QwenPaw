@@ -26,12 +26,7 @@ from ...config.context import (
 )
 
 
-class SandboxViolationError(Exception):
-    """Raised when a sandboxed command tries to access a restricted resource."""
-
-    def __init__(self, violation_msg: str):
-        self.violation_msg = violation_msg
-        super().__init__(f"Sandbox violation: {violation_msg}")
+from ...sandbox import ExecutionResult
 
 
 def _kill_process_tree_win32(pid: int) -> None:
@@ -372,66 +367,16 @@ async def _execute_in_sandbox(
     sandbox_config: Any,
     timeout: float,
     cwd: str,
-) -> ToolChunk:
-    """Execute a shell command inside the sandbox."""
-    import logging as _logging
-    _logger = _logging.getLogger(__name__)
+) -> ExecutionResult:
+    """Execute a shell command inside the sandbox and return raw result."""
     from ...sandbox import create_sandbox
 
     sandbox_config.timeout_seconds = int(timeout)
-    _logger.info(
-        "[sandbox] executing cmd=%r cwd=%s mode=%s mounts=%s",
-        cmd, cwd,
-        getattr(sandbox_config, "mode", None),
-        [(m.path, m.writable) for m in getattr(sandbox_config, "mounts", [])],
-    )
+
     async with create_sandbox(sandbox_config) as sandbox:
-        _logger.info("[sandbox] sandbox created: %s", type(sandbox).__name__)
         result = await sandbox.execute(cmd, cwd=cwd)
-    _logger.info(
-        "[sandbox] done exit_code=%d timed_out=%s duration_ms=%d",
-        result.exit_code, result.timed_out, result.duration_ms,
-    )
-    if result.exit_code != 0:
-        _logger.info(
-            "[sandbox] stdout: %s", result.stdout[:500] if result.stdout else "",
-        )
-        _logger.info(
-            "[sandbox] stderr: %s", result.stderr[:500] if result.stderr else "",
-        )
-        if result.sandbox_violation:
-            _logger.info(
-                "[sandbox] violation: %s", result.sandbox_violation[:500],
-            )
 
-    # Sandbox violation: command tried to access something not permitted
-    # TODO: case: ls -lh ~/Library/Keychains  | wc -l
-    #             no sandbox_violation, but has Operation not permitted in stderr
-    if result.sandbox_violation:
-        raise SandboxViolationError(result.sandbox_violation)
-
-    if result.exit_code == 0:
-        response_text = result.stdout or "Command executed successfully (no output)."
-        if result.stderr:
-            response_text += f"\n[stderr]\n{result.stderr}"
-    else:
-        parts = [f"Command failed with exit code {result.exit_code}."]
-        if result.stdout:
-            parts.append(f"\n[stdout]\n{result.stdout}")
-        if result.stderr:
-            parts.append(f"\n[stderr]\n{result.stderr}")
-        response_text = "".join(parts)
-
-    return ToolChunk(
-        is_last=True,
-        state=ToolResultState.SUCCESS,
-        content=[
-            TextBlock(
-                type="text",
-                text=response_text,
-            ),
-        ],
-    )
+    return result
 
 
 # pylint: disable=too-many-branches, too-many-statements
@@ -509,8 +454,43 @@ async def execute_shell_command(
     )
 
     if sandbox_config is not None:
-        return await _execute_in_sandbox(
+        result = await _execute_in_sandbox(
             cmd, sandbox_config, timeout, str(working_dir),
+        )
+        # Sandbox violation: command tried to access something not permitted
+        if result.sandbox_violation:
+            return ToolChunk(
+                is_last=True,
+                state=ToolResultState.DENIED,
+                content=[
+                    TextBlock(
+                        type="text",
+                        text=f"Sandbox violation: {result.sandbox_violation}\n"
+                             f"Command was blocked by sandbox security policy.",
+                    ),
+                ],
+                metadata={"sandbox_violation": result.sandbox_violation},
+            )
+        if result.exit_code == 0:
+            response_text = result.stdout or "Command executed successfully (no output)."
+            if result.stderr:
+                response_text += f"\n[stderr]\n{result.stderr}"
+        else:
+            parts = [f"Command failed with exit code {result.exit_code}."]
+            if result.stdout:
+                parts.append(f"\n[stdout]\n{result.stdout}")
+            if result.stderr:
+                parts.append(f"\n[stderr]\n{result.stderr}")
+            response_text = "".join(parts)
+        return ToolChunk(
+            is_last=True,
+            state=ToolResultState.SUCCESS,
+            content=[
+                TextBlock(
+                    type="text",
+                    text=response_text,
+                ),
+            ],
         )
 
     import logging as _logging
