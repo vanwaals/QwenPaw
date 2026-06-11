@@ -99,15 +99,166 @@ class ExecutionResult:
     sandbox_violation: Optional[str] = None
 
 
-def detect_platform_mode() -> SandboxMode:
-    """根据当前 OS 自动选择沙箱模式。"""
+@dataclass
+class SandboxCapability:
+    """平台沙箱支持探测结果。启动时调用 probe_sandbox_support() 获取。"""
+
+    supported: bool
+    mode: SandboxMode
+    reason: str  # 人类可读原因
+    landlock_abi_version: int = 0  # Linux 专属：Landlock ABI 版本（0=不支持）
+
+
+def _probe_linux_landlock() -> SandboxCapability:
+    """探测 Linux Landlock 支持情况。
+
+    检测步骤：
+        1. 内核版本 >= 5.13
+        2. /sys/kernel/security/lsm 包含 "landlock"
+        3. 尝试 landlock_create_ruleset syscall 探测 ABI 版本
+    """
+    import os
+    import struct
+    import ctypes
+    import ctypes.util
+
+    # Step 1: 检查内核版本
+    try:
+        release = os.uname().release  # e.g. "5.15.0-125-generic"
+        parts = release.split(".", 2)
+        major, minor = int(parts[0]), int(parts[1])
+    except (AttributeError, ValueError, IndexError):
+        return SandboxCapability(
+            supported=False,
+            mode=SandboxMode.NONE,
+            reason="Cannot parse kernel version",
+        )
+
+    if (major, minor) < (5, 13):
+        return SandboxCapability(
+            supported=False,
+            mode=SandboxMode.NONE,
+            reason=f"Kernel {major}.{minor} < 5.13, Landlock unavailable",
+        )
+
+    # Step 2: 检查 LSM 列表
+    try:
+        with open("/sys/kernel/security/lsm", "r") as f:
+            lsm_list = f.read().strip()
+        if "landlock" not in lsm_list:
+            return SandboxCapability(
+                supported=False,
+                mode=SandboxMode.NONE,
+                reason=f"Landlock not in LSM list: {lsm_list}",
+            )
+    except OSError:
+        return SandboxCapability(
+            supported=False,
+            mode=SandboxMode.NONE,
+            reason="Cannot read /sys/kernel/security/lsm",
+        )
+
+    # Step 3: 探测 ABI 版本 via landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+        # syscall numbers for x86_64
+        import platform
+        arch = platform.machine()
+        if arch == "x86_64":
+            SYS_landlock_create_ruleset = 444
+        elif arch == "aarch64":
+            SYS_landlock_create_ruleset = 444
+        else:
+            # Fallback: assume support based on kernel + LSM check
+            return SandboxCapability(
+                supported=True,
+                mode=SandboxMode.LANDLOCK,
+                reason=f"Kernel {major}.{minor}, Landlock in LSM (ABI version unknown, arch={arch})",
+                landlock_abi_version=1,
+            )
+
+        LANDLOCK_CREATE_RULESET_VERSION = 1 << 0  # flags bit
+
+        # landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION) returns ABI version
+        libc.syscall.restype = ctypes.c_long
+        libc.syscall.argtypes = [ctypes.c_long, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32]
+        abi_version = libc.syscall(
+            SYS_landlock_create_ruleset,
+            None,  # attr = NULL
+            0,     # size = 0
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+
+        if abi_version < 0:
+            errno = ctypes.get_errno()
+            return SandboxCapability(
+                supported=False,
+                mode=SandboxMode.NONE,
+                reason=f"landlock_create_ruleset syscall failed, errno={errno}",
+            )
+
+        return SandboxCapability(
+            supported=True,
+            mode=SandboxMode.LANDLOCK,
+            reason=f"Kernel {major}.{minor}, Landlock ABI v{abi_version}",
+            landlock_abi_version=int(abi_version),
+        )
+    except (OSError, AttributeError) as e:
+        return SandboxCapability(
+            supported=False,
+            mode=SandboxMode.NONE,
+            reason=f"Landlock syscall probe failed: {e}",
+        )
+
+
+def _probe_macos_seatbelt() -> SandboxCapability:
+    """探测 macOS Seatbelt 支持情况。"""
+    import shutil
+
+    if shutil.which("sandbox-exec"):
+        return SandboxCapability(
+            supported=True,
+            mode=SandboxMode.SEATBELT,
+            reason="sandbox-exec available",
+        )
+    return SandboxCapability(
+        supported=False,
+        mode=SandboxMode.NONE,
+        reason="sandbox-exec not found",
+    )
+
+
+def probe_sandbox_support() -> SandboxCapability:
+    """启动时探测当前平台沙箱支持情况。
+
+    返回 SandboxCapability 描述是否支持沙箱隔离。
+    如果不支持，mode 为 NONE，调用方应据此阻止 SANDBOX_FALLBACK 路径。
+    """
     import sys
 
     if sys.platform == "darwin":
-        return SandboxMode.SEATBELT
+        return _probe_macos_seatbelt()
     elif sys.platform == "linux":
-        return SandboxMode.LANDLOCK
+        return _probe_linux_landlock()
     elif sys.platform == "win32":
-        return SandboxMode.WSL2
+        return SandboxCapability(
+            supported=False,
+            mode=SandboxMode.NONE,
+            reason="Windows sandbox not yet implemented",
+        )
     else:
-        return SandboxMode.NONE
+        return SandboxCapability(
+            supported=False,
+            mode=SandboxMode.NONE,
+            reason=f"Unsupported platform: {sys.platform}",
+        )
+
+
+def detect_platform_mode() -> SandboxMode:
+    """根据当前 OS 自动选择沙箱模式。
+
+    调用 probe_sandbox_support() 进行真实能力探测：
+    如果平台不支持沙箱隔离，返回 NONE。
+    """
+    cap = probe_sandbox_support()
+    return cap.mode

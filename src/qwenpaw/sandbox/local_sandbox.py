@@ -352,15 +352,17 @@ def create_sandbox(config: SandboxConfig) -> LocalSandbox:
 
     支持:
       - SEATBELT → MacOSSandbox
+      - LANDLOCK → LinuxSandbox
       - NONE → NoneSandbox
-      - LANDLOCK / WSL2 → 抛出 NotImplementedError
+      - WSL2 → 抛出 NotImplementedError
     """
     if config.mode == SandboxMode.SEATBELT:
         return MacOSSandbox(config)
     elif config.mode == SandboxMode.NONE:
         return NoneSandbox(config)
     elif config.mode == SandboxMode.LANDLOCK:
-        raise NotImplementedError("Landlock sandbox not yet implemented")
+        from .linux_sandbox import LinuxSandbox
+        return LinuxSandbox(config)
     elif config.mode == SandboxMode.WSL2:
         raise NotImplementedError("WSL2 sandbox not yet implemented")
     else:

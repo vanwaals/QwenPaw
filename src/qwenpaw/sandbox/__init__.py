@@ -3,6 +3,7 @@
 
 支持模式：
   - SEATBELT: macOS sandbox-exec 内核隔离
+  - LANDLOCK: Linux Landlock LSM 内核隔离 (5.13+)
   - NONE: 不隔离，直接执行
 
 生命周期：per-tool-call（用完即销毁）。
@@ -23,9 +24,11 @@ from .config import (
     ExecutionResult,
     MountSpec,
     PortRule,
+    SandboxCapability,
     SandboxConfig,
     SandboxMode,
     detect_platform_mode,
+    probe_sandbox_support,
 )
 from .local_sandbox import (
     LocalSandbox,
@@ -41,8 +44,10 @@ __all__ = [
     "MountSpec",
     "NoneSandbox",
     "PortRule",
+    "SandboxCapability",
     "SandboxConfig",
     "SandboxMode",
     "create_sandbox",
     "detect_platform_mode",
+    "probe_sandbox_support",
 ]

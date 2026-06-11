@@ -4,6 +4,7 @@
 核心职责：策略评估、审计记录、动态追加规则、编译 sandbox config。
 """
 from __future__ import annotations
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +15,8 @@ from .policy import (
     _parse_match,
 )
 from .audit import AuditLog
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -57,17 +60,40 @@ class ResourceGovernor:
         # policy 存储在 workspace 外的独立路径，防止 agent 改写
         self._policy_dir = Path.home() / ".qwenpaw" / "policies" / self.workspace_dir.name
         self._policy: Optional[GovernancePolicy] = None
+        self._sandbox_available: bool = False
+        self._sandbox_capability = None  # SandboxCapability, set in start()
 
     # ------------------------------------------------------------------
     # 生命周期（保留但不展开，与 runtime 有重叠）
     # ------------------------------------------------------------------
 
+    @property
+    def sandbox_available(self) -> bool:
+        """当前平台是否支持沙箱隔离。启动后可读。"""
+        return self._sandbox_available
+
+    @property
+    def sandbox_capability(self):
+        """启动探测结果（SandboxCapability）。"""
+        return self._sandbox_capability
+
     def start(self) -> None:
-        """加载 policy。"""
+        """加载 policy 并探测沙箱能力。"""
         self._policy_dir.mkdir(parents=True, exist_ok=True)
         self._policy = load_governance_policy(
             str(self._policy_dir), str(self.workspace_dir),
         )
+
+        # 早期探测：当前平台是否支持沙箱
+        from qwenpaw.sandbox.config import probe_sandbox_support
+        self._sandbox_capability = probe_sandbox_support()
+        self._sandbox_available = self._sandbox_capability.supported
+        if not self._sandbox_available:
+            logger.warning(
+                "ResourceGovernor: sandbox not available — %s. "
+                "SANDBOX_FALLBACK will escalate to ASK.",
+                self._sandbox_capability.reason,
+            )
 
     def stop(self) -> None:
         """持久化 policy（如有变更）。"""
@@ -106,6 +132,17 @@ class ResourceGovernor:
             tool_call.tool_name, target,
             tool_call.agent_id, tool_call.session_id,
         )
+
+        # 早期探测降级：如果 sandbox 不可用，SANDBOX_FALLBACK 升级为 ASK
+        if decision is PolicyDecision.SANDBOX_FALLBACK and not self._sandbox_available:
+            logger.info(
+                "ResourceGovernor: sandbox unavailable, escalating "
+                "SANDBOX_FALLBACK to ASK for tool '%s'",
+                tool_call.tool_name,
+            )
+            decision = PolicyDecision.ASK
+            reason = f"sandbox unavailable ({self._sandbox_capability.reason}), ask user"
+
         # 审计记录
         AuditLog.get_instance().record(
             str(self.workspace_dir), tool_call, decision, reason=reason,

@@ -449,12 +449,24 @@ def _glob_match(target: str, pattern: str) -> bool:
 
     fnmatch 的 * 不匹配 /，但 policy 规则中 Read(WORKSPACE_DIR/*) 的 *
     应匹配 WORKSPACE_DIR/src/main.py 这类嵌套路径。
+
+    目录自身匹配：pattern 以 /** 结尾时，也匹配目录本身（去掉尾部 /**）。
+    例：**/.ssh/** 同时匹配 ~/.ssh/id_rsa 和 ~/.ssh 。
     """
     if fnmatch(target, pattern):
         return True
     # * → ** 让通配符跨目录
     if "*" in pattern and "/" in pattern:
-        return fnmatch(target, pattern.replace("*", "**"))
+        if fnmatch(target, pattern.replace("*", "**")):
+            return True
+    # 目录自身匹配：pattern 以 /** 结尾 → 去掉尾部 /** 再匹配
+    if pattern.endswith("/**"):
+        dir_pattern = pattern[:-3]
+        if fnmatch(target, dir_pattern):
+            return True
+        if "*" in dir_pattern and "/" in dir_pattern:
+            if fnmatch(target, dir_pattern.replace("*", "**")):
+                return True
     return False
 
 
