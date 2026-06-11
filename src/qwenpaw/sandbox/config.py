@@ -228,6 +228,59 @@ def _probe_macos_seatbelt() -> SandboxCapability:
     )
 
 
+def _probe_windows_wsl2() -> SandboxCapability:
+    """探测 Windows WSL2 + Landlock 支持情况。
+
+    检测步骤：
+        1. wsl.exe 是否可用
+        2. 是否有 WSL2 发行版
+        3. WSL2 发行版内是否有 python3
+        4. WSL2 发行版内核是否支持 Landlock
+    """
+    try:
+        from .windows_sandbox import (
+            check_wsl_landlock,
+            check_wsl_python3,
+            probe_wsl2_availability,
+        )
+    except ImportError as e:
+        return SandboxCapability(
+            supported=False,
+            mode=SandboxMode.NONE,
+            reason=f"Failed to import windows_sandbox module: {e}",
+        )
+
+    available, distro, reason = probe_wsl2_availability()
+    if not available:
+        return SandboxCapability(
+            supported=False,
+            mode=SandboxMode.NONE,
+            reason=f"WSL2 unavailable: {reason}",
+        )
+
+    if not check_wsl_python3(distro):
+        return SandboxCapability(
+            supported=False,
+            mode=SandboxMode.NONE,
+            reason=f"python3 not found in WSL2 distro '{distro}'",
+        )
+
+    supported, abi_version = check_wsl_landlock(distro)
+    if not supported:
+        return SandboxCapability(
+            supported=False,
+            mode=SandboxMode.NONE,
+            reason=f"Landlock not supported in WSL2 distro '{distro}' kernel",
+        )
+
+    return SandboxCapability(
+        supported=True,
+        mode=SandboxMode.WSL2,
+        reason=f"WSL2 distro '{distro}' with Landlock ABI v{abi_version}",
+        landlock_abi_version=abi_version,
+    )
+
+
 def probe_sandbox_support() -> SandboxCapability:
     """启动时探测当前平台沙箱支持情况。
 
@@ -241,11 +294,7 @@ def probe_sandbox_support() -> SandboxCapability:
     elif sys.platform == "linux":
         return _probe_linux_landlock()
     elif sys.platform == "win32":
-        return SandboxCapability(
-            supported=False,
-            mode=SandboxMode.NONE,
-            reason="Windows sandbox not yet implemented",
-        )
+        return _probe_windows_wsl2()
     else:
         return SandboxCapability(
             supported=False,

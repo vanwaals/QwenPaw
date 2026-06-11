@@ -4,6 +4,7 @@
 支持模式：
   - SEATBELT: macOS sandbox-exec 内核隔离
   - LANDLOCK: Linux Landlock LSM 内核隔离 (5.13+)
+  - WSL2: Windows WSL2 委托执行 + Landlock 隔离
   - NONE: 不隔离，直接执行
 
 生命周期：per-tool-call（用完即销毁）。
@@ -36,6 +37,7 @@ from .local_sandbox import (
     NoneSandbox,
     create_sandbox,
 )
+from .windows_sandbox import WindowsSandbox
 
 __all__ = [
     "ExecutionResult",
@@ -47,6 +49,7 @@ __all__ = [
     "SandboxCapability",
     "SandboxConfig",
     "SandboxMode",
+    "WindowsSandbox",
     "create_sandbox",
     "detect_platform_mode",
     "probe_sandbox_support",

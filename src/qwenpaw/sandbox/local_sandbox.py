@@ -364,6 +364,7 @@ def create_sandbox(config: SandboxConfig) -> LocalSandbox:
         from .linux_sandbox import LinuxSandbox
         return LinuxSandbox(config)
     elif config.mode == SandboxMode.WSL2:
-        raise NotImplementedError("WSL2 sandbox not yet implemented")
+        from .windows_sandbox import WindowsSandbox
+        return WindowsSandbox(config)
     else:
         raise ValueError(f"Unknown sandbox mode: {config.mode}")
