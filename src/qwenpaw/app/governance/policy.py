@@ -90,8 +90,19 @@ class PolicyRule:
     duration: str = "permanent"             # "session" | "permanent"
     session_id: Optional[str] = None        # Chat session ID
 
-    def matches_tool_call(self, tool_name: str, target: str,
-                          agent_id: str, session_id: str = "",
+    def _globmatch(self, pattern: str, target: str) -> bool:
+        """wcmatch globmatch with directory self-match support."""
+        from wcmatch import glob
+        flags = glob.GLOBSTAR | glob.BRACE | glob.NEGATE | glob.SPLIT
+        if glob.globmatch(target, pattern, flags=flags):
+            return True
+        if pattern.endswith("/**"):
+            dir_pattern = pattern[:-3]
+            if glob.globmatch(target, dir_pattern, flags=flags):
+                return True
+        return False
+
+    def matches_tool_call(self, tc_spec: ToolCallSpec,
                           tool_type: str = "") -> bool:
         """Determine whether this rule matches the given tool call.
 
@@ -108,41 +119,25 @@ class PolicyRule:
               (WORKSPACE_DIR replacement is done at load time).
         """
         # grantee check
-        if self.grantee != "*" and self.grantee != agent_id:
+        if self.grantee != "*" and self.grantee != tc_spec.agent_id:
             return False
         # session-level rule: bound to a specific chat session
-        if self.duration == "session" and self.session_id and session_id:
-            if self.session_id != session_id:
+        if self.duration == "session" and self.session_id and tc_spec.session_id:
+            if self.session_id != tc_spec.session_id:
                 return False
         # parse "ToolName(pattern)"
         rule_tool, rule_pattern = _parse_match(self.match)
         # "*" matches all tools (used for builtin resource protection)
-        if rule_tool != "*" and rule_tool != tool_name:
+        if rule_tool != "*" and rule_tool != tc_spec.tool_name:
             return False
         is_wildcard = rule_tool == "*"
-        # standard glob match
-        if _glob_match(target, rule_pattern):
-            return True
 
-        if is_wildcard:
-            if tool_type == "shell" and target:
-                # Example: *(.env*) matches Bash("cat .env")
-                # For **/*.pem patterns, also match tokens against basename (*.pem)
-                pattern_basename = Path(rule_pattern).name if "/" in rule_pattern else rule_pattern
-                # Skip pure-wildcard basename (e.g. **/.ssh/** → ** would spuriously match any token)
-                _skip_basename = not pattern_basename.replace("*", "").replace("?", "")
-                for token in target.split():
-                    if _glob_match(token, rule_pattern):
-                        return True
-                    if (not _skip_basename and pattern_basename != rule_pattern and fnmatch(token, pattern_basename)):
-                        return True
-            else:
-                # File/Network tool: also match against basename.
-                # Example: *(.env*) should match Read("/ws/.env.local")
-                basename = Path(target).name if target else ""
-                if basename and fnmatch(basename, rule_pattern):
-                    return True
-        return False
+        use_globmatch = is_wildcard or tool_type == "file"
+
+        if use_globmatch:
+            return self._globmatch(rule_pattern, tc_spec.target)
+        else:
+            return fnmatch(tc_spec.target, rule_pattern)
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +147,7 @@ class PolicyRule:
 DEFAULT_BUILTIN_RULES: List[PolicyRule] = [
     # ── Resource protection (any tool access requires user confirmation) ──
     PolicyRule(
-        match="*(.env*)",
+        match="*(**/.env*)",
         action=PolicyAction.ASK,
         reason="Env file may contain secrets/credentials",
     ),
@@ -207,40 +202,20 @@ DEFAULT_BUILTIN_RULES: List[PolicyRule] = [
         reason="npm auth token file",
     ),
     PolicyRule(
-        match="*(**/*.pypirc)",
+        match="*(**/.pypirc)",
         action=PolicyAction.ASK,
         reason="PyPI API token file",
     ),
     # ── High-risk commands (hard wall, never allowed) ──
     PolicyRule(
-        match="Bash(rm -rf /)",
+        match="Bash(rm * -rf *//*)",
         action=PolicyAction.DENY,
         reason="Root filesystem deletion",
-    ),
-    PolicyRule(
-        match="Bash(rm -rf /*)",
-        action=PolicyAction.DENY,
-        reason="Root filesystem deletion (glob variant)",
     ),
     PolicyRule(
         match="Bash(sudo *)",
         action=PolicyAction.DENY,
         reason="Privilege escalation prohibited",
-    ),
-    PolicyRule(
-        match="Bash(chmod 777 *)",
-        action=PolicyAction.DENY,
-        reason="Overly permissive file mode",
-    ),
-    PolicyRule(
-        match="Bash(mkfs *)",
-        action=PolicyAction.DENY,
-        reason="Filesystem format command",
-    ),
-    PolicyRule(
-        match="Bash(dd *)",
-        action=PolicyAction.DENY,
-        reason="Raw disk write command",
     ),
 ]
 
@@ -316,20 +291,20 @@ DEFAULT_USER_RULES: List[PolicyRule] = [
     PolicyRule(match="DelegateExternalAgent(*)", action=PolicyAction.ALLOW,
                reason="Inter-agent delegation"),
     # ── File tools (operations within WORKSPACE_DIR, always allowed) ──
-    PolicyRule(match="Read(WORKSPACE_DIR/*)", action=PolicyAction.ALLOW,
+    PolicyRule(match="Read(WORKSPACE_DIR/**)", action=PolicyAction.ALLOW,
                reason="File read within workspace"),
-    PolicyRule(match="Write(WORKSPACE_DIR/*)", action=PolicyAction.ALLOW,
+    PolicyRule(match="Write(WORKSPACE_DIR/**)", action=PolicyAction.ALLOW,
                reason="File write within workspace"),
-    PolicyRule(match="Edit(WORKSPACE_DIR/*)", action=PolicyAction.ALLOW,
+    PolicyRule(match="Edit(WORKSPACE_DIR/**)", action=PolicyAction.ALLOW,
                reason="File edit within workspace"),
-    PolicyRule(match="Append(WORKSPACE_DIR/*)", action=PolicyAction.ALLOW,
+    PolicyRule(match="Append(WORKSPACE_DIR/**)", action=PolicyAction.ALLOW,
                reason="File append within workspace"),
-    PolicyRule(match="Grep(WORKSPACE_DIR/*)", action=PolicyAction.ALLOW,
+    PolicyRule(match="Grep(WORKSPACE_DIR/**)", action=PolicyAction.ALLOW,
                reason="Content search within workspace"),
-    PolicyRule(match="Glob(WORKSPACE_DIR/*)", action=PolicyAction.ALLOW,
+    PolicyRule(match="Glob(WORKSPACE_DIR/**)", action=PolicyAction.ALLOW,
                reason="File listing within workspace"),
     # ── Browser (treat as always allowed for now) ──
-    PolicyRule(match="Browser(*)", action=PolicyAction.ALLOW,
+    PolicyRule(match="Browser(**)", action=PolicyAction.ALLOW,
                reason="Allow all browser access"),
 ]
 
@@ -378,8 +353,7 @@ class GovernancePolicy:
         return list(self.builtin_rules) + list(self.user_rules)
 
     def evaluate(
-        self, tool_name: str, target: str,
-        agent_id: str, session_id: str = "",
+        self, tc_spec: ToolCallSpec,
     ) -> tuple[PolicyDecision, str]:
         """Evaluate policy decision for a tool call, returning the matched rule's reason.
 
@@ -392,23 +366,23 @@ class GovernancePolicy:
         Returns: (PolicyDecision, reason)
         """
         # ── Step 0: ToolRegistry type check ──
-        tool_type = self._registry.get_type(tool_name)
+        tool_type = self._registry.get_type(tc_spec.tool_name)
         if tool_type == "unknown":
-            return PolicyDecision.DENY, f"Unregistered tool: {tool_name}"
+            return PolicyDecision.DENY, f"Unregistered tool: {tc_spec.tool_name}"
         if tool_type == "internal":
             return PolicyDecision.ALLOW, ""
 
         # ── Step 1: builtin_rules ──
         for rule in self.builtin_rules:
             if rule.matches_tool_call(
-                tool_name, target, agent_id, session_id, tool_type=tool_type,
+                tc_spec, tool_type=tool_type,
             ):
                 return PolicyDecision(rule.action.value), rule.reason
 
         # ── Step 2: user_rules ──
         for rule in self.user_rules:
             if rule.matches_tool_call(
-                tool_name, target, agent_id, session_id, tool_type=tool_type,
+                tc_spec, tool_type=tool_type,
             ):
                 return PolicyDecision(rule.action.value), rule.reason
 
@@ -417,8 +391,7 @@ class GovernancePolicy:
             return PolicyDecision.SANDBOX_FALLBACK, "sandbox fallback"
         return PolicyDecision.ASK, "No rule hit"
 
-    def evaluate_source(self, tool_name: str, target: str,
-                        agent_id: str, session_id: str = "") -> str:
+    def evaluate_source(self, tc_spec: ToolCallSpec) -> str:
         """Determine which rule source a tool call matches.
 
         Returns:
@@ -426,15 +399,15 @@ class GovernancePolicy:
             "user"     — matched user_rules (rule can be recorded on approve)
             "fallback" — no match, global fallback
         """
-        tool_type = self._registry.get_type(tool_name)
+        tool_type = self._registry.get_type(tc_spec.tool_name)
         for rule in self.builtin_rules:
             if rule.matches_tool_call(
-                tool_name, target, agent_id, session_id, tool_type=tool_type,
+                tc_spec, tool_type=tool_type,
             ):
                 return "builtin"
         for rule in self.user_rules:
             if rule.matches_tool_call(
-                tool_name, target, agent_id, session_id, tool_type=tool_type,
+                tc_spec, tool_type=tool_type,
             ):
                 return "user"
         return "fallback"
@@ -486,43 +459,18 @@ def generalize_rule_match(tool_name: str, target: str) -> str:
 def _parse_match(match_str: str) -> tuple[str, str]:
     """Parse "ToolName(pattern)" → (tool_name, pattern).
 
-    Uses rindex to find the last "(", handling cases where pattern contains "(".
+    Uses index to find the first "(", since the tool name never contains "(".
+    Uses rindex to find the last ")" to handle cases where pattern contains ")".
     Example: "Bash(git *)" → ("Bash", "git *")
              "*(.env*)"   → ("*", ".env*")      # wildcard for all tools
              "Read(src/**)" → ("Read", "src/**")
+             "Bash(echo $(date))" → ("Bash", "echo $(date)")
     """
-    paren = match_str.rindex("(")
+    paren = match_str.index("(")
     close = match_str.rindex(")")
     tool_name = match_str[:paren]
     pattern = match_str[paren + 1:close]
     return tool_name, pattern
-
-
-def _glob_match(target: str, pattern: str) -> bool:
-    """Glob matching where * can cross directory separators.
-
-    fnmatch's * does not match /, but in policy rules Read(WORKSPACE_DIR/*) the *
-    should match nested paths like WORKSPACE_DIR/src/main.py.
-
-    Directory self-match: when pattern ends with /**, also match the directory itself
-    (strip trailing /**).
-    Example: **/.ssh/** matches both ~/.ssh/id_rsa and ~/.ssh .
-    """
-    if fnmatch(target, pattern):
-        return True
-    # * → ** to let wildcards cross directory boundaries
-    if "*" in pattern and "/" in pattern:
-        if fnmatch(target, pattern.replace("*", "**")):
-            return True
-    # Directory self-match: pattern ends with /** → strip /** and match again
-    if pattern.endswith("/**"):
-        dir_pattern = pattern[:-3]
-        if fnmatch(target, dir_pattern):
-            return True
-        if "*" in dir_pattern and "/" in dir_pattern:
-            if fnmatch(target, dir_pattern.replace("*", "**")):
-                return True
-    return False
 
 
 # ---------------------------------------------------------------------------

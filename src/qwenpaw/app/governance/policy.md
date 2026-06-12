@@ -358,17 +358,17 @@ user_rules:
   action: allow
 
 # ── File 类 tool（WORKSPACE_DIR 内文件操作，永远可以执行）──
-- match: "Read(WORKSPACE_DIR/*)"
+- match: "Read(WORKSPACE_DIR/**)"
   action: allow
-- match: "Write(WORKSPACE_DIR/*)"
+- match: "Write(WORKSPACE_DIR/**)"
   action: allow
-- match: "Edit(WORKSPACE_DIR/*)"
+- match: "Edit(WORKSPACE_DIR/**)"
   action: allow
-- match: "Append(WORKSPACE_DIR/*)"
+- match: "Append(WORKSPACE_DIR/**)"
   action: allow
-- match: "Grep(WORKSPACE_DIR/*)"
+- match: "Grep(WORKSPACE_DIR/**)"
   action: allow
-- match: "Glob(WORKSPACE_DIR/*)"
+- match: "Glob(WORKSPACE_DIR/**)"
   action: allow
 
 # ── Browser（暂且当做永远可以执行）──
@@ -382,14 +382,15 @@ user_rules:
 - **Browser 暂且永远可执行** — 后续可改为 ask 或更细粒度的域名白名单
 
 **`WORKSPACE_DIR` 占位符**：
-- 规则中 `WORKSPACE_DIR/*` 是占位符，在 `evaluate()` 时替换为实际的 workspace 路径
-- 例：workspace 为 `/home/user/project` 时，`Read(WORKSPACE_DIR/*)` 匹配 `Read("/home/user/project/src/main.py")`
+- 规则中 `WORKSPACE_DIR/**` 是占位符，在 `evaluate()` 时替换为实际的 workspace 路径
+- `**` 表示递归匹配任意层级子目录（由 wcmatch GLOBSTAR 语义保证）
+- 例：workspace 为 `/home/user/project` 时，`Read(WORKSPACE_DIR/**)` 匹配 `Read("/home/user/project/src/main.py")`
 - 这样 File tool 默认规则只允许 workspace 内的文件操作，workspace 外的文件需要 builtin_rules 放行或走 fallback
 
 **与 builtin_rules 的关系**：
 - builtin_rules 优先评估，保护敏感资源（`.env`、`.ssh` 等）
 - default user_rules 提供基本可用性，不会覆盖 builtin_rules 的保护
-- 例：`Read(".env.production")` → builtin ask（builtin 先命中），不会被 default user_rules 的 `Read(WORKSPACE_DIR/*)` 覆盖（`.env.production` 虽在 workspace 内，但 builtin 优先级更高）
+- 例：`Read(".env.production")` → builtin ask（builtin 先命中），不会被 default user_rules 的 `Read(WORKSPACE_DIR/**)` 覆盖（`.env.production` 虽在 workspace 内，但 builtin 优先级更高）
 
 ## 五、评估流程
 
@@ -440,7 +441,7 @@ Tool Call 进来
 
 ```
 ① builtin_rules → 无命中
-② user_rules   → 命中 "Read(WORKSPACE_DIR/*)" → allow（默认规则）
+② user_rules   → 命中 "Read(WORKSPACE_DIR/**)" → allow（默认规则）
 → PolicyDecision: ALLOW
 ```
 

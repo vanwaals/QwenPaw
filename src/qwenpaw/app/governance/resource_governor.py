@@ -90,7 +90,7 @@ class ResourceGovernor:
         """Evaluate policy for a tool call and record an audit log entry.
 
         Flow:
-            1. policy.evaluate(tool_name, target, agent_id) → decision
+            1. policy.evaluate(tc_spec) → decision
             2. audit_log.append(tc_spec, decision)
             3. return decision
 
@@ -101,17 +101,7 @@ class ResourceGovernor:
             ASK              → ask user
             SANDBOX_FALLBACK → bash tool with no rule match, sandbox fallback
         """
-        # For file tools, resolve relative target paths to absolute paths
-        # (shell/network/internal tool targets are not file paths, no resolution needed)
-        target = tc_spec.target
-        tool_type = self._policy._registry.get_type(tc_spec.tool_name)
-        if tool_type in ("file", "unknown") and target and not Path(target).is_absolute():
-            target = str(self.workspace_dir / target)
-
-        decision, reason = self.policy.evaluate(
-            tc_spec.tool_name, target,
-            tc_spec.agent_id, tc_spec.session_id,
-        )
+        decision, reason = self.policy.evaluate(tc_spec)
 
         # Early probe degradation: if sandbox is unavailable, escalate SANDBOX_FALLBACK to ASK
         if decision is PolicyDecision.SANDBOX_FALLBACK and not self._sandbox_available:
@@ -259,10 +249,7 @@ class ResourceGovernor:
         """
         if not self._policy:
             return False
-        source = self._policy.evaluate_source(
-            tc_spec.tool_name, tc_spec.target,
-            tc_spec.agent_id, tc_spec.session_id,
-        )
+        source = self._policy.evaluate_source(tc_spec)
         return source == "builtin"
 
     # ------------------------------------------------------------------
